@@ -14,9 +14,15 @@
 #include <tf2/LinearMath/Vector3.h>
 #include <sensor_msgs/LaserScan.h>
 #include <sensor_msgs/PointCloud.h>
+#include <sensor_msgs/PointCloud2.h>
 #include <geometry_msgs/TransformStamped.h>
 #include <geometry_msgs/Point32.h>
 #include <tf2/impl/utils.h>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <tf2_eigen/tf2_eigen.h>
+#include <opencv2/opencv.hpp>
 
 #define MATCH_THRESHOLD 10
 #define Hydrant_Height 0.71
@@ -26,12 +32,15 @@
 #define FY 530.47
 typedef actionlib::SimpleActionClient<move_base_msgs::MoveBaseAction> MoveBaseClient;
 using namespace std;
+// using namespace pcl;
+using namespace cv;
 
 string camera_frame_id("camera_link");
 string base_frame_id("base_link");
 string odom_frame_id("odom");
-string lidar_frame_id("base_scan");
-
+string lidar_frame_id("lidar_link");
+string world_frame_id("world_link");
+typedef pcl::PointXYZ PointType;
 class TargetFollow{
 protected:
     ros::NodeHandle nh_;
@@ -42,6 +51,7 @@ protected:
     shared_ptr<tf2_ros::Buffer> buffer_;
     shared_ptr<tf2_ros::TransformListener> tf_listener_;
     shared_ptr<sensor_msgs::PointCloud> point_cloud_;
+    shared_ptr<pcl::PointCloud<PointType>> point_cloud_world_;
     shared_ptr<sensor_msgs::PointCloud> target_point_cloud_;
     shared_ptr<message_filters::Subscriber<sensor_msgs::LaserScan>> scan_sub_;
     shared_ptr<tf2_ros::MessageFilter<sensor_msgs::LaserScan>> scan_filter_;
@@ -52,6 +62,8 @@ protected:
     double dist_scan_;
     ros::Time last_update_;
     double reference_;//目的地距目标参考距离
+    cv::Mat image;
+
 
 public:
     TargetFollow(ros::NodeHandle& nodehandle, double frequency):nh_(nodehandle), yaw_camera_(0), yaw_scan_(0),
@@ -68,7 +80,6 @@ public:
             ros::Duration(0.5).sleep();
         }
         geometry_msgs::TransformStamped camera2scan = buffer_->lookupTransform(camera_frame_id, lidar_frame_id, ros::Time(0));
-
         tf2::Quaternion quat_tf;
         tf2::fromMsg(camera2scan.transform.rotation, quat_tf);
         camera2scan_yaw_ = tf2::impl::getYaw(quat_tf);
@@ -78,38 +89,65 @@ public:
     ~TargetFollow(){
         if(main_thread_.use_count() > 0) main_thread_->join();
     }
-    void scanCallback(const sensor_msgs::LaserScan::ConstPtr &msg){
-        shared_ptr<sensor_msgs::PointCloud> temp_cloud = make_shared<sensor_msgs::PointCloud>();
-        temp_cloud->header = msg->header;
-        for(size_t i = 0; i < msg->ranges.size(); i++){
-            double beam_yaw = msg->angle_min + i * msg->angle_increment;
-            geometry_msgs::PointStamped point_stamped;
-            point_stamped.point.x = msg->ranges[i]*cos(beam_yaw);
-            point_stamped.point.y = msg->ranges[i]*sin(beam_yaw);
-            point_stamped.point.z = 0;
-            point_stamped.header = msg->header;
-            point_stamped = buffer_->transform<geometry_msgs::PointStamped>(point_stamped, odom_frame_id, ros::Duration(0));
-            geometry_msgs::Point32 point32;
-            point32.x = point_stamped.point.x;
-            point32.y = point_stamped.point.y;
-            point32.z = point_stamped.point.z;
-            temp_cloud->points.push_back(point32);
+
+    void scanCallback(const sensor_msgs::PointCloud::ConstPtr &msg){  //三维点云处理 PointCloud2是点云数据格式，需要转成pcl格式更方便处理
+        // shared_ptr<sensor_msgs::PointCloud> temp_cloud = make_shared<sensor_msgs::PointCloud>();
+        
+
+        pcl::PointCloud<PointType> pointcloud;//模板点云类，模板参数是点的格式
+        pcl::fromROSMsg(*msg, pointcloud);//把ROS消息转化成pcl点云格式
+
+        Eigen::Matrix3d camInRefer;
+        camInRefer << FX, 0, CX,
+                      0, FY, CY,
+                      0,  0,  1;
+        Eigen::Matrix3d pixel;
+        Eigen::Matrix3d lidar_coord;
+        Eigen::Matrix3d world_coord;
+
+        for (uint i = 0; i < pointcloud.points.size(); i++){//遍历点云的每一个点，uint表示无符号的ints
+            // pointcloud.points[i];//每一个点
+            geometry_msgs::TransformStamped transform = buffer_->lookupTransform(world_frame_id, lidar_frame_id,ros::Time().fromSec(pointcloud.points[i].x),ros::Duration(0.01)); //通过slam计算得出的雷达在世界坐标系下的坐标，得到转换关系T矩阵
+            Eigen::Isometry3d eigen_transform = tf2::transformToEigen(transform); //通过Eigen将T矩阵转换成单位向量矩阵
+            lidar_coord << pointcloud.points[i].x, pointcloud.points[i].y, pointcloud.points[i].z;//雷达坐标系点的坐标
+            world_coord = eigen_transform * lidar_coord; //计算每一个点云在世界坐标系下的坐标
+            
+            //3DTo2D
+            pixel = camInRefer * eigen_transform * world_coord; //每一个点云的世界坐标转换为像素坐标 
+            double u = pixel[0];
+            double v = pixel[1];
+
+            int radiusCircle = 30;
+            cv::Point centerCircle(u, v);
+            cv::Scalar colorCircle(0, 255, 0);
+            cv::circle(image, centerCircle, radiusCircle, colorCircle, cv::FILLED); 
+
+            //2DTo3D
+            
+
         }
-        point_cloud_ = temp_cloud;
+        // point_cloud_world_ = temp_cloud;
+
+
+
     }
+
+    //2DTo3D
     void detectCallback(const nav_follow::BoundingBoxes::ConstPtr &msg){   //检测回调函数，定义输入取msg的位置
         if(msg->bounding_boxes.size()>0){        //bounding_box数>0
             vector<tf2::Vector3> rays;           //定义像素射线容器
             geometry_msgs::TransformStamped cam2odom;
             if(!buffer_->canTransform(odom_frame_id, camera_frame_id, msg->header.stamp, ros::Duration(0))) return;
             try{
-                cam2odom = buffer_->lookupTransform(odom_frame_id, camera_frame_id, msg->header.stamp, ros::Duration(0));
+                cam2odom = buffer_->lookupTransform(odom_frame_id, camera_frame_id, msg->header.stamp, ros::Duration(0)); //查询odomid和图像id
             }
             catch(tf2::TransformException ex){
                 ROS_ERROR("%s", ex.what());
             }
+
+            //bbox的中心坐标和高
             for(size_t i=0; i < msg->bounding_boxes.size(); i++){
-                double px = (msg->bounding_boxes[0].xmin + msg->bounding_boxes[0].xmax) / 2.0;
+                double px = (msg->bounding_boxes[0].xmin + msg->bounding_boxes[0].xmax) / 2.0; 
                 double py = (msg->bounding_boxes[0].ymin + msg->bounding_boxes[0].ymax) / 2.0;
                 double h = (msg->bounding_boxes[0].ymax - msg->bounding_boxes[0].ymin);
 
@@ -131,11 +169,13 @@ public:
             vector<double> detec_min_dist2(rays.size(), std::numeric_limits<double>::max());
             weak_ptr<sensor_msgs::PointCloud> cloud_weak_ptr(point_cloud_);
             auto point_cloud = cloud_weak_ptr.lock();
-            for(size_t i=0; i < point_cloud->points.size(); i++){
+
+            
+            for(size_t i=0; i < point_cloud->points.size(); i++){ //遍历点云
                 double point_min_dist2 = std::numeric_limits<double>::max();
                 int detec_match_id = -1;
                 shared_ptr<tf2::Vector3> point_vector = make_shared<tf2::Vector3>(point_cloud->points[i].x-cam2odom.transform.translation.x, point_cloud->points[i].y-cam2odom.transform.translation.y, point_cloud->points[i].z-cam2odom.transform.translation.z);
-                for(size_t j=0; j<rays.size(); j++){
+                for(size_t j=0; j<rays.size(); j++){  //遍历像素射线容器
                     double inner_prod = rays[j].dot(*point_vector);
                     if(inner_prod < 0) continue;
                     double vertical_dist2 = point_vector->length2() - pow(inner_prod, 2);
