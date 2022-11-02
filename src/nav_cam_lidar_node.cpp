@@ -68,6 +68,7 @@ public:
             ros::Duration(0.5).sleep();
         }
         geometry_msgs::TransformStamped camera2scan = buffer_->lookupTransform(camera_frame_id, lidar_frame_id, ros::Time(0));
+
         tf2::Quaternion quat_tf;
         tf2::fromMsg(camera2scan.transform.rotation, quat_tf);
         camera2scan_yaw_ = tf2::impl::getYaw(quat_tf);
