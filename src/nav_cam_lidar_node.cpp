@@ -12,7 +12,7 @@
 #include <move_base_msgs/MoveBaseAction.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Vector3.h>
-#include <sensor_msgs/LaserScan.h>
+#include <sensor_msgs/PointCloud2.h>
 #include <sensor_msgs/PointCloud.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <geometry_msgs/TransformStamped.h>
@@ -35,12 +35,34 @@ using namespace std;
 // using namespace pcl;
 using namespace cv;
 
+//ANCHOR robosense modify
+namespace robosense_ros {
+    struct EIGEN_ALIGN16 Point {
+        PCL_ADD_POINT4D;
+        uint8_t intensity;
+        uint16_t ring;
+        double timestamp;
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    };
+}
+
+// namespace robosense_ros
+POINT_CLOUD_REGISTER_POINT_STRUCT(robosense_ros::Point,
+    (float, x, x)
+    (float, y, y)
+    (float, z, z)
+    // use std::uint32_t to avoid conflicting with pcl::uint32_t
+    (std::uint8_t, intensity, intensity)
+    (std::uint16_t, ring, ring)
+    (double, timestamp, timestamp)
+)
+
 string camera_frame_id("camera_link");
 string base_frame_id("base_link");
 string odom_frame_id("odom");
 string lidar_frame_id("lidar_link");
 string world_frame_id("world_link");
-typedef pcl::PointXYZ PointType;
+typedef robosense_ros::Point PointType;
 class TargetFollow{
 protected:
     ros::NodeHandle nh_;
@@ -53,8 +75,8 @@ protected:
     shared_ptr<sensor_msgs::PointCloud> point_cloud_;
     shared_ptr<pcl::PointCloud<PointType>> point_cloud_world_;
     shared_ptr<sensor_msgs::PointCloud> target_point_cloud_;
-    shared_ptr<message_filters::Subscriber<sensor_msgs::LaserScan>> scan_sub_;
-    shared_ptr<tf2_ros::MessageFilter<sensor_msgs::LaserScan>> scan_filter_;
+    shared_ptr<message_filters::Subscriber<sensor_msgs::PointCloud2>> scan_sub_;
+    shared_ptr<tf2_ros::MessageFilter<sensor_msgs::PointCloud2>> scan_filter_;
     double yaw_camera_;
     double yaw_scan_;
     double camera2scan_yaw_;
@@ -72,8 +94,8 @@ public:
         detect_sub_ = nh_.subscribe<nav_follow::BoundingBoxes>("/detected_objects_in_image", 2, &TargetFollow::detectCallback, this); 
         point_pub_ = nh_.advertise<sensor_msgs::PointCloud>("/tracks", 10);
         buffer_ = make_shared<tf2_ros::Buffer>(ros::Duration(15));
-        scan_sub_ = make_shared<message_filters::Subscriber<sensor_msgs::LaserScan>>(nh_, "/scan", 2);
-        scan_filter_ = make_shared<tf2_ros::MessageFilter<sensor_msgs::LaserScan>>(*scan_sub_, *buffer_, odom_frame_id, 2, nh_);
+        scan_sub_ = make_shared<message_filters::Subscriber<sensor_msgs::PointCloud2>>(nh_, "/scan", 2);
+        scan_filter_ = make_shared<tf2_ros::MessageFilter<sensor_msgs::PointCloud2>>(*scan_sub_, *buffer_, odom_frame_id, 2, nh_);
         scan_filter_->registerCallback(boost::bind(&TargetFollow::scanCallback, this, _1));//tf过滤器注册回调函数
         while(!buffer_->canTransform(lidar_frame_id, camera_frame_id, ros::Time(0))){
             ROS_INFO("Wait for transform from camera_link to base_scan... \n");
@@ -90,7 +112,7 @@ public:
         if(main_thread_.use_count() > 0) main_thread_->join();
     }
 
-    void scanCallback(const sensor_msgs::PointCloud::ConstPtr &msg){  //三维点云处理 PointCloud2是点云数据格式，需要转成pcl格式更方便处理
+    void scanCallback(const sensor_msgs::PointCloud2::ConstPtr &msg){  //三维点云处理 PointCloud2是点云数据格式，需要转成pcl格式更方便处理
         // shared_ptr<sensor_msgs::PointCloud> temp_cloud = make_shared<sensor_msgs::PointCloud>();
         
 
@@ -101,9 +123,9 @@ public:
         camInRefer << FX, 0, CX,
                       0, FY, CY,
                       0,  0,  1;
-        Eigen::Matrix3d pixel;
-        Eigen::Matrix3d lidar_coord;
-        Eigen::Matrix3d world_coord;
+        Eigen::Vector3d pixel;
+        Eigen::Vector3d lidar_coord;
+        Eigen::Vector3d world_coord;
 
         for (uint i = 0; i < pointcloud.points.size(); i++){//遍历点云的每一个点，uint表示无符号的ints
             // pointcloud.points[i];//每一个点
