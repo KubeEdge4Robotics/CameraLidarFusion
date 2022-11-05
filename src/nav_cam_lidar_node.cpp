@@ -8,7 +8,7 @@
 #include <message_filters/subscriber.h>
 #include <tf2_ros/message_filter.h>
 //引入消息头文件
-#include <nav_follow/BoundingBoxes.h>
+#include <nav_follow/BoundingBoxes.h> 
 #include <move_base_msgs/MoveBaseAction.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/LinearMath/Vector3.h>
@@ -18,7 +18,9 @@
 #include <geometry_msgs/TransformStamped.h>
 #include <geometry_msgs/Point32.h>
 #include <tf2/impl/utils.h>
+#include <iostream>
 #include <pcl/point_cloud.h>
+#include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <tf2_eigen/tf2_eigen.h>
@@ -26,10 +28,10 @@
 
 #define MATCH_THRESHOLD 10
 #define Hydrant_Height 0.71
-#define CX 320
-#define FX 530.47
-#define CY 240
-#define FY 530.47
+#define CX 709.10707009309931
+#define FX 1055.5366632011774
+#define CY 546.67189220332762
+#define FY 1055.3868813798128
 typedef actionlib::SimpleActionClient<move_base_msgs::MoveBaseAction> MoveBaseClient;
 using namespace std;
 // using namespace pcl;
@@ -45,7 +47,6 @@ namespace robosense_ros {
         EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     };
 }
-
 // namespace robosense_ros
 POINT_CLOUD_REGISTER_POINT_STRUCT(robosense_ros::Point,
     (float, x, x)
@@ -62,8 +63,9 @@ string base_frame_id("base_link");
 string odom_frame_id("odom");
 string lidar_frame_id("lidar_link");
 string world_frame_id("world_link");
+cv::Mat image;
 typedef robosense_ros::Point PointType;
-class TargetFollow{
+class CamLidarFusion{
 protected:
     ros::NodeHandle nh_;
     ros::Subscriber detect_sub_;
@@ -77,77 +79,41 @@ protected:
     shared_ptr<sensor_msgs::PointCloud> target_point_cloud_;
     shared_ptr<message_filters::Subscriber<sensor_msgs::PointCloud2>> scan_sub_;
     shared_ptr<tf2_ros::MessageFilter<sensor_msgs::PointCloud2>> scan_filter_;
-    double yaw_camera_;
     double yaw_scan_;
     double camera2scan_yaw_;
     double dist_camera_;
     double dist_scan_;
     ros::Time last_update_;
-    double reference_;//目的地距目标参考距离
-    cv::Mat image;
+    
 
 
 public:
-    TargetFollow(ros::NodeHandle& nodehandle, double frequency):nh_(nodehandle), yaw_camera_(0), yaw_scan_(0),
-    camera2scan_yaw_(0), dist_camera_(0), dist_scan_(0), last_update_(ros::Time::now()),reference_(1.5){
+    CamLidarFusion(ros::NodeHandle& nodehandle, double frequency):nh_(nodehandle), yaw_scan_(0),
+    camera2scan_yaw_(0), dist_camera_(0), dist_scan_(0), last_update_(ros::Time::now()){
         ac_ = make_shared<MoveBaseClient>("move_base", true);
-        detect_sub_ = nh_.subscribe<nav_follow::BoundingBoxes>("/detected_objects_in_image", 2, &TargetFollow::detectCallback, this); 
+        detect_sub_ = nh_.subscribe<nav_follow::BoundingBoxes>("/detected_objects_in_image", 2, &CamLidarFusion::detectCallback, this); 
         point_pub_ = nh_.advertise<sensor_msgs::PointCloud>("/tracks", 10);
         buffer_ = make_shared<tf2_ros::Buffer>(ros::Duration(15));
         scan_sub_ = make_shared<message_filters::Subscriber<sensor_msgs::PointCloud2>>(nh_, "/scan", 2);
         scan_filter_ = make_shared<tf2_ros::MessageFilter<sensor_msgs::PointCloud2>>(*scan_sub_, *buffer_, odom_frame_id, 2, nh_);
-        scan_filter_->registerCallback(boost::bind(&TargetFollow::scanCallback, this, _1));//tf过滤器注册回调函数
-        while(!buffer_->canTransform(lidar_frame_id, camera_frame_id, ros::Time(0))){
-            ROS_INFO("Wait for transform from camera_link to base_scan... \n");
-            ros::Duration(0.5).sleep();
-        }
-        geometry_msgs::TransformStamped camera2scan = buffer_->lookupTransform(camera_frame_id, lidar_frame_id, ros::Time(0));
-        tf2::Quaternion quat_tf;
-        tf2::fromMsg(camera2scan.transform.rotation, quat_tf);
-        camera2scan_yaw_ = tf2::impl::getYaw(quat_tf);
-        ROS_INFO("Yaw for scan to camera is %s\n", camera2scan_yaw_);
-        main_thread_ = make_shared<std::thread>(std::bind(&TargetFollow::mainProcessLoop, this, frequency));
+        scan_filter_->registerCallback(boost::bind(&CamLidarFusion::scanCallback, this, _1));//tf过滤器注册回调函数
+        // while(!buffer_->canTransform(lidar_frame_id, camera_frame_id, ros::Time(0))){
+        //     ROS_INFO("Wait for transform from camera_link to base_scan... \n");
+        //     ros::Duration(0.5).sleep();
+        // }
+        // geometry_msgs::TransformStamped camera2scan = buffer_->lookupTransform(camera_frame_id, lidar_frame_id, ros::Time(0));
+        // tf2::Quaternion quat_tf;
+        // tf2::fromMsg(camera2scan.transform.rotation, quat_tf);
+        // camera2scan_yaw_ = tf2::impl::getYaw(quat_tf);
+        // ROS_INFO("Yaw for scan to camera is %s\n", camera2scan_yaw_);
+        // main_thread_ = make_shared<std::thread>(std::bind(&CamLidarFusion::mainProcessLoop, this, frequency));
     }
-    ~TargetFollow(){
+    ~CamLidarFusion(){
         if(main_thread_.use_count() > 0) main_thread_->join();
     }
 
     void scanCallback(const sensor_msgs::PointCloud2::ConstPtr &msg){  //三维点云处理 PointCloud2是点云数据格式，需要转成pcl格式更方便处理
         // shared_ptr<sensor_msgs::PointCloud> temp_cloud = make_shared<sensor_msgs::PointCloud>();
-        
-
-        pcl::PointCloud<PointType> pointcloud;//模板点云类，模板参数是点的格式
-        pcl::fromROSMsg(*msg, pointcloud);//把ROS消息转化成pcl点云格式
-
-        Eigen::Matrix3d camInRefer;
-        camInRefer << FX, 0, CX,
-                      0, FY, CY,
-                      0,  0,  1;
-        Eigen::Vector3d pixel;
-        Eigen::Vector3d lidar_coord;
-        Eigen::Vector3d world_coord;
-
-        for (uint i = 0; i < pointcloud.points.size(); i++){//遍历点云的每一个点，uint表示无符号的ints
-            // pointcloud.points[i];//每一个点
-            geometry_msgs::TransformStamped transform = buffer_->lookupTransform(world_frame_id, lidar_frame_id,ros::Time().fromSec(pointcloud.points[i].x),ros::Duration(0.01)); //通过slam计算得出的雷达在世界坐标系下的坐标，得到转换关系T矩阵
-            Eigen::Isometry3d eigen_transform = tf2::transformToEigen(transform); //通过Eigen将T矩阵转换成单位向量矩阵
-            lidar_coord << pointcloud.points[i].x, pointcloud.points[i].y, pointcloud.points[i].z;//雷达坐标系点的坐标
-            world_coord = eigen_transform * lidar_coord; //计算每一个点云在世界坐标系下的坐标
-            
-            //3DTo2D
-            pixel = camInRefer * eigen_transform * world_coord; //每一个点云的世界坐标转换为像素坐标 
-            double u = pixel[0];
-            double v = pixel[1];
-
-            int radiusCircle = 30;
-            cv::Point centerCircle(u, v);
-            cv::Scalar colorCircle(0, 255, 0);
-            cv::circle(image, centerCircle, radiusCircle, colorCircle, cv::FILLED); 
-
-            //2DTo3D
-            
-
-        }
         // point_cloud_world_ = temp_cloud;
 
 
@@ -261,29 +227,29 @@ public:
                 dist = sqrt( dx * dx + dy * dy);
                 yaw = atan2(dy, dx);
             }
-            move_base_msgs::MoveBaseGoal goal;
-            if(dist > 1.1*reference_ || ! flag){
-                goal.target_pose.header.frame_id = odom_frame_id;
-                goal.target_pose.header.stamp = point_cloud->header.stamp;
-                goal.target_pose.pose.position.x = (dist - reference_) * cos(yaw);
-                goal.target_pose.pose.position.y = (dist - reference_) * sin(yaw);
-                tf2::Quaternion q; q.setRPY(0,0,yaw);
-                goal.target_pose.pose.orientation.x = q.getX();
-                goal.target_pose.pose.orientation.y = q.getY();
-                goal.target_pose.pose.orientation.z = q.getZ();
-                goal.target_pose.pose.orientation.w = q.getW();
-                ac_->sendGoal(goal);
-            }
-            else{
-                ac_->waitForResult();
-                if(ac_->getState() == actionlib::SimpleClientGoalState::SUCCEEDED){
-                    flag = true;
-                    ROS_INFO("Reached goal!\n");
-                }
-                else {
-                    ROS_INFO("Failed!\n");
-                }
-            }
+            // move_base_msgs::MoveBaseGoal goal;
+            // if(dist > 1.1*reference_ || ! flag){
+            //     goal.target_pose.header.frame_id = odom_frame_id;
+            //     goal.target_pose.header.stamp = point_cloud->header.stamp;
+            //     goal.target_pose.pose.position.x = (dist - reference_) * cos(yaw);
+            //     goal.target_pose.pose.position.y = (dist - reference_) * sin(yaw);
+            //     tf2::Quaternion q; q.setRPY(0,0,yaw);
+            //     goal.target_pose.pose.orientation.x = q.getX();
+            //     goal.target_pose.pose.orientation.y = q.getY();
+            //     goal.target_pose.pose.orientation.z = q.getZ();
+            //     goal.target_pose.pose.orientation.w = q.getW();
+            //     ac_->sendGoal(goal);
+            // }
+            // else{
+            //     ac_->waitForResult();
+            //     if(ac_->getState() == actionlib::SimpleClientGoalState::SUCCEEDED){
+            //         flag = true;
+            //         ROS_INFO("Reached goal!\n");
+            //     }
+            //     else {
+            //         ROS_INFO("Failed!\n");
+            //     }
+            // }
             // ac_->cancelAllGoals();//cancel all goals
             loop_rate.sleep();
         }
@@ -295,8 +261,68 @@ int main(int argc, char** argv){
     ros::init(argc, argv, "nav");
     ROS_INFO("Follow begin!\n");
     ros::NodeHandle nh("");
-    TargetFollow ttf(nh, 10);
+    CamLidarFusion ttf(nh, 10);
 
-    ros::spin();
+    //read image
+    image = cv::imread("/root/fusion/data/image/1663836987.5956383.jpeg");
+
+    // pcl::PointCloud<PointType> cloud;//模板点云类，模板参数是点的格式
+    // pcl::fromROSMsg(*msg, cloud);//把ROS消息转化成pcl点云格式
+    //读取pcd文件
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud (new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::io::loadPCDFile<pcl::PointXYZ> ("/root/fusion/data/lidar/1663836987659170.pcd", *cloud);//load the file
+
+    Eigen::Matrix3d camInRefer;
+    camInRefer <<   FX, 0, CX,
+                    0, FY, CY,
+                    0,  0,  1;
+    Eigen::Matrix3d cam2lidar_R;
+    cam2lidar_R << 3.3876939304536846e-01, 2.0411991267696605e-02, 9.4064799417643996e-01,
+                   -9.4086852267540699e-01, 8.7436721632269121e-03, 3.3865907818291047e-01,
+                   -1.3120115354801065e-03, -9.9975341900370074e-01, 2.2167088580625049e-02;
+    Eigen::Vector3d cam2lidar_t;
+    cam2lidar_t << 0.16, 0.105, -0.095;
+    Eigen::Vector3d pixel;
+    Eigen::Vector3d lidar_coord;
+    // Eigen::Vector3d world_coord;
+    Eigen::Vector3d cam_coord;
+
+
+    // for (uint i = 0; i < cloud->points.size(); i++){//遍历点云的每一个点，uint表示无符号的ints
+        // pointcloud.points[i];//每一个点
+        // geometry_msgs::TransformStamped transform = buffer_->lookupTransform(world_frame_id, lidar_frame_id,ros::Time().fromSec(cloud->points[i].x),ros::Duration(0.01)); //通过slam计算得出的雷达在世界坐标系下的坐标，得到转换关系T矩阵
+        // Eigen::Isometry3d eigen_transform = tf2::transformToEigen(transform); //通过Eigen将T矩阵转换成单位向量矩阵
+        
+        // lidar_coord << cloud->points[i].x, cloud->points[i].y, cloud->points[i].z;//雷达坐标系点的坐标
+        lidar_coord << 10, 0, 0;
+        // world_coord = eigen_transform * lidar_coord; //计算每一个点云在世界坐标系下的坐标
+        
+        //3DTo2D
+        Eigen::Isometry3d cam2lidar;
+        Eigen::Isometry3d lidar2cam;
+        // 求雷达坐标的逆矩阵
+        cam2lidar.rotate(cam2lidar_R);
+        cam2lidar.pretranslate(cam2lidar_t);
+        lidar2cam = cam2lidar.inverse();
+        cam_coord = lidar2cam * lidar_coord; // 归一化相机三维坐标 = 雷达坐标->相机坐标->归一化
+        cam_coord[0] = cam_coord[0]/cam_coord[2];
+        cam_coord[1] = cam_coord[1]/cam_coord[2];
+        cam_coord[2] = 1;
+        pixel = camInRefer * cam_coord; //图像像素=相机内参矩阵*归一化相机三维坐标
+        double u = pixel[0];
+        double v = pixel[1];
+
+        cout <<"u="<< u <<" v="<< v << endl;
+        //2DTo3D
+        int radiusCircle = 30;
+        cv::Point centerCircle(u, v);
+        cv::Scalar colorCircle(0, 255, 0);
+        cv::circle(image, centerCircle, radiusCircle, colorCircle, cv::FILLED); 
+
+    // }
+    cout << "transform success" <<endl;
+    cv::imwrite("/root/fusion/data/test.jpeg",image);
+
+    // ros::spin();
     return 0;
 }

@@ -6,9 +6,8 @@
         "limitSymbolsToIncludedHeaders": false
       },
       "includePath": [
-        "/home/long/Code/test_ws/devel/include/**",
+        "${workspaceFolder}/**",
         "/opt/ros/noetic/include/**",
-        "/home/long/Code/test_ws/src/test_rs/include/**",
         "/usr/include/**"
       ],
       "name": "ROS",
